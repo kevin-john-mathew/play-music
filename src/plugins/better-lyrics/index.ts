@@ -1,0 +1,1671 @@
+import fs from 'fs';
+import path from 'path';
+
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  session,
+  webFrame,
+  type MenuItemConstructorOptions,
+} from 'electron';
+
+import * as config from '@/config';
+import { restart } from '@/providers/app-controls';
+import { openFontSettingsWindow } from '@/providers/font-settings';
+import { createPlugin } from '@/utils';
+
+import {
+  PLAYMUSIC_THEME_LOCK_ATTRIBUTE,
+  PLAYMUSIC_THEME_LOCK_KEY,
+  isPlayMusicMergeTheme,
+} from './theme';
+
+// ID này lấy từ manifest key bạn cung cấp, hoặc bạn xem log cũ (mjfeakl...)
+// Nếu build xong mở không lên thì check log xem ID thực tế là gì rồi thay vào đây
+const EXTENSION_ID = 'effdbpeggelllpfkjppbokhmmiinhlmg';
+
+// Where the settings UI lives inside the extension, if its manifest cannot be read.
+// The two engines disagree: the old one emits options_ui/page.html and
+// action/default_popup.html, while the new one's build tool names both index.html
+// under options/ and action/. Loading the wrong pair fails with ERR_FILE_NOT_FOUND.
+const FALLBACK_SETTINGS_PAGES = {
+  old: { optionsPage: 'options_ui/page.html', popupPage: 'action/default_popup.html' },
+  new: { optionsPage: 'options/index.html', popupPage: 'action/index.html' },
+} as const;
+
+function extensionDir(isNewEngine: boolean): string {
+  const basePath = app.isPackaged
+    ? process.resourcesPath
+    : path.join(__dirname, '../../');
+  return path.join(basePath, 'extensions', isNewEngine ? 'bl-dev' : 'bl');
+}
+
+// Reads the settings page paths out of the extension's own manifest so an upstream
+// rename cannot silently break the menu item again. Falls back to the known-good
+// pair for the engine when the manifest is missing, unreadable, or does not declare
+// the fields.
+function resolveSettingsPages(isNewEngine: boolean): {
+  optionsPage: string;
+  popupPage: string;
+} {
+  const fallback = FALLBACK_SETTINGS_PAGES[isNewEngine ? 'new' : 'old'];
+
+  try {
+    const manifestPath = path.join(extensionDir(isNewEngine), 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
+      options_ui?: { page?: unknown };
+      action?: { default_popup?: unknown };
+    };
+
+    const page = manifest.options_ui?.page;
+    const popup = manifest.action?.default_popup;
+
+    return {
+      optionsPage: typeof page === 'string' && page ? page : fallback.optionsPage,
+      popupPage: typeof popup === 'string' && popup ? popup : fallback.popupPage,
+    };
+  } catch (err) {
+    console.error('[BetterLyrics] Could not read manifest for settings page:', err);
+    return fallback;
+  }
+}
+
+export default createPlugin({
+  name: () => 'Better Lyrics',
+  restartNeeded: false,
+  config: {
+    enabled: true,
+    enableV4Scroll: true,
+    // Turbo is the default: same spring motion as 'playmusicflow', but baked into
+    // WAAPI keyframes so it runs on the compositor instead of writing style
+    // every frame. 'playmusicflow' stays available as a fallback.
+    scrollingMode: 'playmusicflow-turbo' as
+      | 'playmusicflow'
+      | 'playmusicflow-turbo'
+      | 'smooth',
+    activeTheme: 'playmusic-merge-theme' as string,
+    engine: 'old' as 'old' | 'new',
+  },
+  // THÊM PHẦN NÀY: Tạo menu để mở cài đặt
+  menu: async ({ getConfig, setConfig, window, refresh }) => {
+    const pluginConfig = await getConfig();
+    const currentEngine = pluginConfig.engine || 'old';
+    const isNewEngine = currentEngine === 'new';
+
+    const menuItems: MenuItemConstructorOptions[] = [
+      {
+        label: 'Open Settings',
+        click: () => {
+          // Create a temp preload script for the settings window
+          const preloadCode = `
+            const { contextBridge, ipcRenderer } = require('electron');
+            contextBridge.exposeInMainWorld('electronBL', {
+              getActiveTheme: () => ipcRenderer.invoke('bl-get-active-theme'),
+              setActiveTheme: (name) => ipcRenderer.invoke('bl-set-active-theme', name),
+              getEngine: () => ipcRenderer.invoke('bl-get-engine'),
+              setEngine: (engine) => ipcRenderer.invoke('bl-set-engine', engine),
+            });
+          `;
+          const preloadPath = path.join(
+            app.getPath('temp'),
+            'bl-settings-preload.js',
+          );
+          fs.writeFileSync(preloadPath, preloadCode);
+
+          const settingsWin = new BrowserWindow({
+            width: 600,
+            height: 700,
+            autoHideMenuBar: true,
+            frame: false,
+            transparent: true,
+            show: false,
+            hasShadow: false,
+            backgroundColor: '#00000000',
+            webPreferences: {
+              nodeIntegration: false,
+              contextIsolation: true,
+              preload: preloadPath,
+            },
+          });
+
+          // Force canvas transparency for chrome-extension pages
+          settingsWin.setBackgroundColor('#00000000');
+
+          const { optionsPage, popupPage } = resolveSettingsPages(isNewEngine);
+
+          settingsWin
+            .loadURL(`chrome-extension://${EXTENSION_ID}/${optionsPage}`)
+            .catch((err) => {
+              console.error('Cannot open settings page:', err);
+              settingsWin.loadURL(
+                `chrome-extension://${EXTENSION_ID}/${popupPage}`,
+              );
+            });
+
+          // Inject frameless window UI after the page loads
+          settingsWin.webContents.on('dom-ready', () => {
+            settingsWin.webContents
+              .executeJavaScript(`
+              (function() {
+                // --- Inject Styles ---
+                const style = document.createElement('style');
+                style.textContent = \`
+                  :root, html {
+                    background: transparent !important;
+                    background-color: transparent !important;
+                    width: 100% !important;
+                    min-width: 100% !important;
+                    max-width: 100% !important;
+                    overflow: hidden !important;
+                  }
+                  
+                  body {
+                    background: transparent !important;
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    overflow: hidden !important;
+                    height: 100vh !important;
+                  }
+
+                  #playmusic-wrapper {
+                    position: fixed;
+                    inset: 0;
+                    background: radial-gradient(circle at top left, rgba(30, 30, 40, 0.85), rgba(15, 15, 18, 0.95));
+                    backdrop-filter: blur(40px) saturate(180%);
+                    -webkit-backdrop-filter: blur(40px) saturate(180%);
+                    border-radius: 16px;
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    overflow: hidden;
+                    display: flex;
+                    flex-direction: column;
+                    box-shadow: 0 25px 60px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+                    clip-path: inset(0 round 16px);
+                    -webkit-app-region: drag;
+                    z-index: 999999;
+                    animation: playmusicAppear 0.65s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+                  }
+
+                  #playmusic-wrapper.closing {
+                    animation: playmusicDisappear 0.4s cubic-bezier(0.32, 0, 0.67, 0) forwards !important;
+                    pointer-events: none;
+                  }
+
+                  #playmusic-wrapper::before {
+                    content: "";
+                    position: absolute;
+                    top: -15%;
+                    left: -15%;
+                    width: 70%;
+                    height: 70%;
+                    background: radial-gradient(circle, rgba(123, 97, 255, 0.18) 0%, rgba(123, 97, 255, 0) 70%);
+                    z-index: -1;
+                    pointer-events: none;
+                    filter: blur(40px);
+                  }
+
+                  #playmusic-wrapper::after {
+                    content: "";
+                    position: absolute;
+                    bottom: -15%;
+                    right: -15%;
+                    width: 70%;
+                    height: 70%;
+                    background: radial-gradient(circle, rgba(0, 242, 254, 0.12) 0%, rgba(0, 242, 254, 0) 70%);
+                    z-index: -1;
+                    pointer-events: none;
+                    filter: blur(40px);
+                  }
+
+                  @keyframes playmusicGlowPulse {
+                    0% {
+                      opacity: 0.7;
+                      transform: scale(0.95) translate(0, 0);
+                    }
+                    100% {
+                      opacity: 1;
+                      transform: scale(1.05) translate(5%, 5%);
+                    }
+                  }
+
+                  @keyframes playmusicAppear {
+                    0% {
+                      opacity: 0;
+                      transform: scale(0.85) translateY(40px);
+                      filter: blur(15px);
+                    }
+                    100% {
+                      opacity: 1;
+                      transform: scale(1) translateY(0);
+                      filter: blur(0px);
+                    }
+                  }
+
+                  @keyframes playmusicDisappear {
+                    0% {
+                      opacity: 1;
+                      transform: scale(1) translateY(0);
+                      filter: blur(0px);
+                    }
+                    40% { opacity: 0.8; }
+                    100% {
+                      opacity: 0;
+                      transform: scale(0.9) translateY(25px);
+                      filter: blur(12px);
+                    }
+                  }
+
+                  /* Ensure the original nav doesn't capture drag */
+                  nav, nav * {
+                    -webkit-app-region: no-drag !important;
+                  }
+
+                  #playmusic-titlebar {
+                    height: 42px;
+                    min-height: 42px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    padding: 0 16px;
+                    -webkit-app-region: drag !important;
+                    user-select: none;
+                    z-index: 10002 !important;
+                    position: relative;
+                  }
+
+                  #playmusic-titlebar-label {
+                    font-family: 'Segoe UI', sans-serif;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: rgba(255,255,255,0.85);
+                    letter-spacing: 0.3px;
+                  }
+
+                  #playmusic-close-btn {
+                    -webkit-app-region: no-drag;
+                    width: 30px;
+                    height: 30px;
+                    background: rgba(255, 255, 255, 0.1);
+                    border-radius: 50%;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    cursor: pointer;
+                    transition: all 0.3s;
+                    border: 1px solid rgba(255, 255, 255, 0.2);
+                    backdrop-filter: blur(10px);
+                  }
+
+                  #playmusic-close-btn:hover {
+                    background: rgba(255, 80, 80, 0.8);
+                    transform: scale(1.1);
+                  }
+
+                  #playmusic-close-btn svg {
+                    width: 13px;
+                    height: 13px;
+                    fill: #fff;
+                  }
+
+                  #playmusic-content {
+                    flex: 1;
+                    overflow: auto;
+                    -webkit-app-region: no-drag;
+                    border-radius: 0 0 16px 16px;
+                    padding: 1.25rem 2rem 1rem !important; /* Restore original body padding */
+                    box-sizing: border-box;
+                    background: rgba(20, 20, 25, 0.5); /* Dark glass layer for readability */
+                    border-top: 1px solid rgba(255,255,255,0.08);
+                  }
+
+                  /* --- Modern Glassmorphism Overrides --- */
+                  
+                  * {
+                    box-sizing: border-box;
+                  }
+
+                  ::-webkit-scrollbar {
+                    width: 8px;
+                    height: 8px;
+                  }
+                  ::-webkit-scrollbar-track {
+                    background: rgba(0, 0, 0, 0.1);
+                    border-radius: 4px;
+                  }
+                  ::-webkit-scrollbar-thumb {
+                    background: rgba(255, 255, 255, 0.2);
+                    border-radius: 4px;
+                  }
+                  ::-webkit-scrollbar-thumb:hover {
+                    background: rgba(255, 255, 255, 0.4);
+                  }
+
+                  body, html {
+                    font-family: 'Satoshi', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+                    color: rgba(255, 255, 255, 0.9) !important;
+                  }
+
+                  #navbar {
+                    background: transparent !important;
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
+                    padding: 0 0 1rem 0 !important;
+                    margin-bottom: 1.5rem !important;
+                    display: flex !important;
+                    justify-content: space-between !important;
+                    align-items: center !important;
+                  }
+
+                  #navbar h1 {
+                    font-size: 1.2rem !important;
+                    font-weight: 700 !important;
+                    text-shadow: 0 2px 10px rgba(0,0,0,0.2) !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    gap: 10px !important;
+                    margin: 0 !important;
+                  }
+                  
+                  #navbar h1 img {
+                    border-radius: 20%;
+                    box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+                  }
+
+                  .heading {
+                    display: flex;
+                    align-items: baseline;
+                    gap: 8px;
+                  }
+
+                  .heading span {
+                    font-size: 0.7rem !important;
+                    background: rgba(255,255,255,0.1);
+                    padding: 2px 6px;
+                    border-radius: 8px;
+                    color: #23d5ab;
+                  }
+
+                  /* Tabs */
+                  .tab-scroll-wrapper {
+                    background: transparent !important;
+                    border: none !important;
+                    box-shadow: none !important;
+                    margin-bottom: 2rem !important;
+                    position: relative !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    border-radius: 16px !important;
+                  }
+
+                  .tab-container {
+                    display: flex !important;
+                    gap: 0.5rem !important;
+                    background: rgba(0, 0, 0, 0.2) !important;
+                    padding: 0.5rem !important;
+                    border-radius: 16px !important;
+                    border: 1px solid rgba(255, 255, 255, 0.05) !important;
+                    overflow-x: auto !important;
+                    scroll-behavior: smooth !important;
+                    flex: 1 !important;
+                    margin-bottom: 0 !important;
+                  }
+
+                  .tab-container::-webkit-scrollbar {
+                    display: none !important;
+                  }
+
+                  .tab-arrow {
+                    background: rgba(255,255,255,0.1) !important;
+                    border: 1px solid rgba(255,255,255,0.1) !important;
+                    color: #fff !important;
+                    border-radius: 50% !important;
+                    width: 32px !important;
+                    height: 32px !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    cursor: pointer !important;
+                    flex-shrink: 0 !important;
+                    backdrop-filter: blur(5px) !important;
+                    transition: all 0.2s !important;
+                    z-index: 10 !important;
+                  }
+
+                  .tab-arrow:hover {
+                    background: rgba(255,255,255,0.2) !important;
+                  }
+
+                  .tab-arrow-left {
+                    margin-right: 0.5rem !important;
+                  }
+
+                  .tab-arrow-right {
+                    margin-left: 0.5rem !important;
+                  }
+
+                  .tab {
+                    background: transparent !important;
+                    border: none !important;
+                    color: rgba(255, 255, 255, 0.6) !important;
+                    padding: 0.6rem 1rem !important;
+                    border-radius: 12px !important;
+                    font-weight: 600 !important;
+                    font-size: 0.9rem !important;
+                    cursor: pointer !important;
+                    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+                    white-space: nowrap;
+                  }
+
+                  .tab:hover {
+                    background: rgba(255, 255, 255, 0.05) !important;
+                    color: rgba(255, 255, 255, 0.9) !important;
+                  }
+
+                  .tab.active {
+                    background: rgba(255, 255, 255, 0.15) !important;
+                    color: #fff !important;
+                    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                  }
+
+                  /* Settings Groups & Containers */
+                  .settings-group {
+                    background: rgba(255, 255, 255, 0.03) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+                    border-radius: 20px !important;
+                    padding: 1.5rem !important;
+                    margin-bottom: 1.5rem !important;
+                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1) !important;
+                    backdrop-filter: blur(10px) !important;
+                  }
+
+                  .settings-group h2 {
+                    display: flex !important;
+                    align-items: center !important;
+                    gap: 0.75rem !important;
+                    font-size: 1.15rem !important;
+                    margin-top: 0 !important;
+                    margin-bottom: 0.5rem !important;
+                    color: #fff !important;
+                  }
+
+                  .settings-group h2 svg {
+                    width: 20px !important;
+                    height: 20px !important;
+                    color: #23a6d5 !important;
+                    filter: drop-shadow(0 0 8px rgba(35, 166, 213, 0.5));
+                  }
+
+                  .settings-group > p {
+                    color: rgba(255, 255, 255, 0.6) !important;
+                    margin-bottom: 1.5rem !important;
+                    line-height: 1.5 !important;
+                    font-size: 0.9rem !important;
+                  }
+
+                  .container {
+                    display: flex !important;
+                    justify-content: space-between !important;
+                    align-items: center !important;
+                    background: rgba(0, 0, 0, 0.2) !important;
+                    padding: 1rem 1.2rem !important;
+                    border-radius: 14px !important;
+                    margin-bottom: 0.75rem !important;
+                    border: 1px solid rgba(255, 255, 255, 0.03) !important;
+                    transition: all 0.3s ease !important;
+                  }
+
+                  .container:hover {
+                    background: rgba(255, 255, 255, 0.06) !important;
+                    border-color: rgba(255, 255, 255, 0.1) !important;
+                    transform: translateY(-1px) !important;
+                  }
+
+                  .container[style*="display: none"] {
+                    display: none !important;
+                  }
+
+                  .container > span {
+                    font-weight: 500 !important;
+                    font-size: 0.95rem !important;
+                  }
+
+                  /* Checkbox Toggle Switch Style */
+                  .container > label {
+                    position: relative !important;
+                    display: inline-block !important;
+                    width: 44px !important;
+                    height: 24px !important;
+                    margin: 0 !important;
+                  }
+
+                  .container > label input {
+                    opacity: 0 !important;
+                    width: 0 !important;
+                    height: 0 !important;
+                  }
+
+                  .container .checkmark {
+                    position: absolute !important;
+                    cursor: pointer !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    right: 0 !important;
+                    bottom: 0 !important;
+                    background-color: rgba(255, 255, 255, 0.1) !important;
+                    transition: .4s !important;
+                    border-radius: 34px !important;
+                    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                  }
+
+                  .container .checkmark:before {
+                    position: absolute !important;
+                    content: "" !important;
+                    height: 16px !important;
+                    width: 16px !important;
+                    left: 3px !important;
+                    bottom: 3px !important;
+                    background-color: #fff !important;
+                    transition: .4s cubic-bezier(0.68, -0.55, 0.265, 1.55) !important;
+                    border-radius: 50% !important;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important;
+                  }
+
+                  .container input:checked + .checkmark {
+                    background-color: #23a6d5 !important;
+                    border-color: #23d5ab !important;
+                    box-shadow: 0 0 12px rgba(35, 166, 213, 0.4) !important;
+                  }
+
+                  .container input:checked + .checkmark:before {
+                    transform: translateX(20px) !important;
+                  }
+
+                  /* Fix for .checkbox-container in Sortable List */
+                  .checkbox-container {
+                    width: 44px !important;
+                    max-width: 44px !important;
+                    height: 24px !important;
+                    margin: 0 !important;
+                  }
+                  .checkbox-container .checkmark {
+                    border-radius: 34px !important;
+                    background-color: rgba(255, 255, 255, 0.1) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                  }
+                  .checkbox-container .checkmark:before {
+                    width: 16px !important;
+                    height: 16px !important;
+                    left: 3px !important;
+                    bottom: 3px !important;
+                    background-color: #fff !important;
+                    border-radius: 50% !important;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important;
+                  }
+                  .checkbox-container input:checked + .checkmark {
+                    background-color: #23a6d5 !important;
+                    border-color: #23d5ab !important;
+                    box-shadow: 0 0 12px rgba(35, 166, 213, 0.4) !important;
+                  }
+                  .checkbox-container input:checked + .checkmark:before {
+                    transform: translateX(20px) !important;
+                  }
+
+                  .provider-name {
+                    margin-left: calc(44px + 1rem) !important;
+                  }
+
+                  /* Buttons */
+                  button:not(.tab) {
+                    background: rgba(255, 255, 255, 0.1) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                    color: #fff !important;
+                    padding: 0.6rem 1.2rem !important;
+                    border-radius: 10px !important;
+                    cursor: pointer !important;
+                    font-weight: 600 !important;
+                    font-size: 0.85rem !important;
+                    transition: all 0.3s ease !important;
+                    display: inline-flex !important;
+                    align-items: center !important;
+                    gap: 0.5rem !important;
+                    backdrop-filter: blur(5px) !important;
+                  }
+
+                  button:not(.tab):hover {
+                    background: rgba(255, 255, 255, 0.2) !important;
+                    transform: translateY(-2px) !important;
+                    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2) !important;
+                  }
+
+                  button:not(.tab):active {
+                    transform: translateY(0) !important;
+                  }
+
+                  button.btn-danger {
+                    background: rgba(231, 60, 126, 0.15) !important;
+                    border-color: rgba(231, 60, 126, 0.3) !important;
+                    color: #ff8fb3 !important;
+                  }
+
+                  button.btn-danger:hover {
+                    background: rgba(231, 60, 126, 0.3) !important;
+                    box-shadow: 0 5px 15px rgba(231, 60, 126, 0.2) !important;
+                  }
+
+                  button svg {
+                    width: 16px !important;
+                    height: 16px !important;
+                  }
+
+                  /* Select */
+                  .select {
+                    position: relative !important;
+                    background: transparent !important;
+                    border: none !important;
+                    padding: 0 !important;
+                  }
+
+                  select {
+                    background: rgba(0, 0, 0, 0.3) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                    color: #fff !important;
+                    padding: 0.6rem 2rem 0.6rem 1rem !important;
+                    border-radius: 10px !important;
+                    appearance: none !important;
+                    font-family: inherit !important;
+                    font-size: 0.9rem !important;
+                    cursor: pointer !important;
+                    backdrop-filter: blur(5px) !important;
+                    transition: all 0.3s ease !important;
+                  }
+
+                  select:hover, select:focus {
+                    background: rgba(0, 0, 0, 0.5) !important;
+                    border-color: rgba(255, 255, 255, 0.3) !important;
+                    outline: none !important;
+                  }
+
+                  .select::after {
+                    content: '▼' !important;
+                    background: none !important;
+                    position: absolute !important;
+                    right: 0.8rem !important;
+                    top: 50% !important;
+                    transform: translateY(-50%) !important;
+                    color: rgba(255, 255, 255, 0.5) !important;
+                    pointer-events: none !important;
+                    font-size: 0.7rem !important;
+                  }
+
+                  select option {
+                    background: #1e1f22 !important;
+                    color: #fff !important;
+                  }
+
+                  /* Modals */
+                  .modal-overlay {
+                    background: rgba(0, 0, 0, 0.5) !important;
+                    backdrop-filter: blur(10px) !important;
+                  }
+
+                  .modal {
+                    background: rgba(30, 31, 34, 0.85) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+                    border-radius: 20px !important;
+                    box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5) !important;
+                    backdrop-filter: blur(25px) saturate(200%) !important;
+                  }
+
+                  .modal-header {
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+                  }
+
+                  .modal-footer {
+                    border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+                    background: transparent !important;
+                  }
+
+                  button.modal-close-btn {
+                    background: transparent !important;
+                    border: none !important;
+                    padding: 0.5rem !important;
+                    width: 32px !important;
+                    height: 32px !important;
+                    display: grid !important;
+                    justify-items: center !important;
+                    align-items: center !important;
+                    box-shadow: none !important;
+                  }
+                  button.modal-close-btn:hover {
+                    background: rgba(255,255,255,0.1) !important;
+                    transform: none !important;
+                    box-shadow: none !important;
+                  }
+                  button.modal-close-btn svg {
+                    fill: currentColor !important;
+                    width: 1.25rem !important;
+                    height: 1.25rem !important;
+                  }
+
+                  /* Offset Stepper Buttons Fix */
+                  .offset-stepper {
+                    display: inline-flex !important;
+                    align-items: center !important;
+                    gap: 0.35rem !important;
+                    background: rgba(0, 0, 0, 0.25) !important;
+                    padding: 4px 6px !important;
+                    border-radius: 12px !important;
+                    border: 1px solid rgba(255, 255, 255, 0.05) !important;
+                  }
+
+                  button.offset-stepper__btn,
+                  .offset-stepper__btn {
+                    width: 28px !important;
+                    height: 28px !important;
+                    min-width: 28px !important;
+                    max-width: 28px !important;
+                    min-height: 28px !important;
+                    max-height: 28px !important;
+                    padding: 0 !important;
+                    margin: 0 !important;
+                    display: inline-flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    background: rgba(255, 255, 255, 0.08) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+                    border-radius: 8px !important;
+                    color: rgba(255, 255, 255, 0.9) !important;
+                    cursor: pointer !important;
+                    box-shadow: none !important;
+                    transform: none !important;
+                    transition: all 0.2s ease !important;
+                  }
+
+                  button.offset-stepper__btn:hover,
+                  .offset-stepper__btn:hover {
+                    background: rgba(255, 255, 255, 0.2) !important;
+                    color: #23d5ab !important;
+                    transform: scale(1.08) !important;
+                  }
+
+                  .offset-stepper__btn svg {
+                    width: 14px !important;
+                    height: 14px !important;
+                    fill: currentColor !important;
+                    display: block !important;
+                    pointer-events: none !important;
+                  }
+
+                  .offset-stepper__value {
+                    min-width: 3.5rem !important;
+                    text-align: center !important;
+                    font-size: 0.9rem !important;
+                    font-weight: 600 !important;
+                    font-family: 'JetBrains Mono', monospace !important;
+                    color: #23d5ab !important;
+                    user-select: none !important;
+                  }
+
+                  /* Miscellaneous */
+                  .text-group {
+                    background: rgba(0, 0, 0, 0.2) !important;
+                    padding: 1.2rem !important;
+                    border-radius: 14px !important;
+                    border: 1px solid rgba(255, 255, 255, 0.03) !important;
+                  }
+
+                  .text-group p {
+                    display: flex !important;
+                    justify-content: space-between !important;
+                    margin: 0.5rem 0 !important;
+                    color: rgba(255, 255, 255, 0.8) !important;
+                    font-size: 0.9rem !important;
+                    align-items: center !important;
+                  }
+
+                  .text-group p span:last-child {
+                    font-family: 'JetBrains Mono', monospace !important;
+                    color: #23d5ab !important;
+                    background: rgba(35, 213, 171, 0.1) !important;
+                    padding: 0.2rem 0.5rem !important;
+                    border-radius: 6px !important;
+                    font-size: 0.85rem !important;
+                  }
+
+                  .dots {
+                    flex-grow: 1 !important;
+                    border-bottom: 1px dashed rgba(255,255,255,0.2) !important;
+                    margin: 0 10px !important;
+                    opacity: 0.5 !important;
+                  }
+
+                  /* Animations */
+                  .tab-content {
+                    display: none;
+                    opacity: 0;
+                  }
+
+                  .tab-content.active {
+                    display: block !important;
+                    animation: fadeUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards !important;
+                  }
+
+                  @keyframes fadeUp {
+                    from {
+                      opacity: 0;
+                      transform: translateY(15px);
+                    }
+                    to {
+                      opacity: 1;
+                      transform: translateY(0);
+                    }
+                  }
+
+                  /* Pre tags / Code blocks */
+                  pre {
+                    background: rgba(0, 0, 0, 0.3) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                    border-radius: 12px !important;
+                    padding: 1.2rem !important;
+                    box-shadow: inset 0 2px 10px rgba(0,0,0,0.2) !important;
+                  }
+
+                  /* Providers list */
+                  .sortable-list {
+                    width: 100% !important;
+                    padding: 0 !important;
+                    margin: 0 !important;
+                    list-style: none !important;
+                  }
+                  
+                  .sortable-list li {
+                    background: rgba(255,255,255,0.05) !important;
+                    border: 1px solid rgba(255,255,255,0.1) !important;
+                    margin-bottom: 8px !important;
+                    padding: 10px 15px !important;
+                    border-radius: 10px !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: space-between !important;
+                  }
+                  
+                  #options {
+                    margin-top: 10px !important;
+                  }
+
+                  /* Modals Extra Styling (Unison & Language Exclusions) */
+                  .modal-tab-container {
+                    background: rgba(0, 0, 0, 0.2) !important;
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+                    padding: 0.5rem 1rem !important;
+                    border-radius: 20px 20px 0 0 !important;
+                  }
+                  .modal-tab {
+                    color: rgba(255, 255, 255, 0.6) !important;
+                    border-radius: 12px !important;
+                  }
+                  .modal-tab.active {
+                    background: rgba(255, 255, 255, 0.15) !important;
+                    color: #fff !important;
+                    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                  }
+                  .lang-search-input {
+                    background: rgba(0, 0, 0, 0.2) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                    color: #fff !important;
+                    border-radius: 10px !important;
+                  }
+                  .lang-search-input:focus {
+                    background: rgba(0, 0, 0, 0.3) !important;
+                    border-color: rgba(35, 213, 171, 0.5) !important;
+                  }
+                  .lang-pill {
+                    background: rgba(255, 255, 255, 0.05) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                    border-radius: 8px !important;
+                  }
+                  .lang-pill:hover {
+                    background: rgba(255, 255, 255, 0.1) !important;
+                  }
+                  .position-frame {
+                    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                    background: rgba(0, 0, 0, 0.2) !important;
+                    border-radius: 16px !important;
+                  }
+                  .position-cell {
+                    background: rgba(255, 255, 255, 0.05) !important;
+                  }
+                  .position-cell:hover {
+                    background: rgba(255, 255, 255, 0.1) !important;
+                  }
+                  .position-cell[data-selected="true"] {
+                    background: rgba(35, 166, 213, 0.3) !important;
+                  }
+                  .position-cell[data-selected="true"]:before {
+                    background: #23d5ab !important;
+                  }
+
+                  /* Fix Toast Notification Overlay */
+                  #status, #status-css {
+                    top: 42px !important;
+                    z-index: 10001 !important;
+                    border-radius: 0 0 16px 16px !important;
+                    width: auto !important;
+                    min-width: 250px !important;
+                    max-width: 80% !important;
+                    background: rgba(30, 31, 34, 0.95) !important;
+                    backdrop-filter: blur(25px) !important;
+                    -webkit-backdrop-filter: blur(25px) !important;
+                    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+                    border-top: none !important;
+                    box-shadow: 0 15px 30px rgba(0, 0, 0, 0.4) !important;
+                    padding: 0.75rem 1.5rem !important;
+                    font-size: 0.95rem !important;
+                    font-weight: 500 !important;
+                  }
+                \`;
+                document.head.appendChild(style);
+
+                // --- Move original body children into wrapper ---
+                const wrapper = document.createElement('div');
+                wrapper.id = 'playmusic-wrapper';
+
+                const titlebar = document.createElement('div');
+                titlebar.id = 'playmusic-titlebar';
+                titlebar.innerHTML = \`
+                  <span id="playmusic-titlebar-label">Better Lyrics Settings${
+                    isNewEngine
+                      ? ' <span style="font-size: 0.7rem; background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); padding: 1px 6px; border-radius: 8px; margin-left: 6px; font-weight: 600; vertical-align: middle;">Beta Engine</span>'
+                      : ''
+                  }</span>
+                  <div id="playmusic-close-btn">
+                    <svg viewBox="0 0 24 24">
+                      <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                  </div>
+                \`;
+
+                const contentArea = document.createElement('div');
+                contentArea.id = 'playmusic-content';
+
+                // Move all existing body children into the content area
+                while (document.body.firstChild) {
+                  contentArea.appendChild(document.body.firstChild);
+                }
+
+                ${
+                  isNewEngine
+                    ? `
+                const expBanner = document.createElement('div');
+                expBanner.style.cssText = 'background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); color: #93c5fd; padding: 10px 14px; border-radius: 12px; margin-bottom: 1rem; font-size: 0.85rem; display: flex; align-items: center; gap: 8px; backdrop-filter: blur(10px);';
+                expBanner.innerHTML = '✨ <span><strong>New Engine (Beta):</strong> You are using the new WAAPI animation engine. This feature is in active development with continuous improvements.</span>';
+                contentArea.insertBefore(expBanner, contentArea.firstChild);
+                `
+                    : ''
+                }
+
+                wrapper.appendChild(titlebar);
+                wrapper.appendChild(contentArea);
+
+                // Move modals and absolute elements out of the scrollable content area
+                // so they don't scroll with the content and position properly
+                const fixedElements = contentArea.querySelectorAll('.modal-overlay, #status-css, #status, #sync-indicator');
+                fixedElements.forEach(el => wrapper.appendChild(el));
+
+                document.body.appendChild(wrapper);
+
+                // --- Close button handler ---
+                document.getElementById('playmusic-close-btn').addEventListener('click', () => {
+                  if (wrapper.classList.contains('closing')) return;
+                  wrapper.classList.add('closing');
+                  setTimeout(() => {
+                    document.title = '__PLAYMUSIC_CLOSE__';
+                  }, 50);
+                });
+
+                // --- Tab arrows injector ---
+                const checkAndInject = setInterval(() => {
+                  const tabWrapper = document.querySelector('.tab-scroll-wrapper');
+                  if (tabWrapper && !tabWrapper.querySelector('.tab-arrow')) {
+                    clearInterval(checkAndInject);
+                    const tabContainer = tabWrapper.querySelector('.tab-container');
+                    if (tabContainer) {
+                      const leftArrow = document.createElement('div');
+                      leftArrow.className = 'tab-arrow tab-arrow-left';
+                      leftArrow.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="white"><path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6 1.41-1.41z"/></svg>';
+                      
+                      const rightArrow = document.createElement('div');
+                      rightArrow.className = 'tab-arrow tab-arrow-right';
+                      rightArrow.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="white"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/></svg>';
+                      
+                      tabWrapper.insertBefore(leftArrow, tabContainer);
+                      tabWrapper.appendChild(rightArrow);
+                      
+                      leftArrow.addEventListener('click', () => {
+                        tabContainer.scrollBy({ left: -150, behavior: 'smooth' });
+                      });
+                      rightArrow.addEventListener('click', () => {
+                        tabContainer.scrollBy({ left: 150, behavior: 'smooth' });
+                      });
+
+                      // Center active tab on click
+                      const tabs = tabContainer.querySelectorAll('.tab');
+                      tabs.forEach(tab => {
+                        tab.addEventListener('click', (e) => {
+                          const tabRect = e.target.getBoundingClientRect();
+                          const containerRect = tabContainer.getBoundingClientRect();
+                          const scrollLeft = tabContainer.scrollLeft + (tabRect.left - containerRect.left) - (containerRect.width / 2) + (tabRect.width / 2);
+                          tabContainer.scrollTo({ left: scrollLeft, behavior: 'smooth' });
+                        });
+                      });
+                    }
+                  }
+                }, 100);
+                setTimeout(() => clearInterval(checkAndInject), 5000); // safety timeout
+              })();
+            `)
+              .then(() => {
+                settingsWin.show();
+              })
+              .catch(console.error);
+          });
+
+          // Handle close animation at Electron level
+          settingsWin.webContents.on('page-title-updated', (event, title) => {
+            event.preventDefault();
+            if (title !== '__PLAYMUSIC_CLOSE__') return;
+            if (settingsWin.isDestroyed()) return;
+
+            setTimeout(() => {
+              if (settingsWin.isDestroyed()) return;
+              let opacity = 1;
+              const steps = 18;
+              const interval = 280 / steps;
+              const fadeTimer = setInterval(() => {
+                opacity -= 1 / steps;
+                if (opacity <= 0) {
+                  clearInterval(fadeTimer);
+                  if (!settingsWin.isDestroyed()) {
+                    settingsWin.destroy();
+                  }
+                } else if (!settingsWin.isDestroyed()) {
+                  settingsWin.setOpacity(Math.max(0, opacity));
+                } else {
+                  clearInterval(fadeTimer);
+                }
+              }, interval);
+            }, 120);
+          });
+        },
+      },
+      {
+        label: 'Change Fonts...',
+        click: () => {
+          openFontSettingsWindow(window);
+        },
+      },
+      {
+        label: 'Engine',
+        submenu: [
+          {
+            label: 'Old engine (Stable)',
+            sublabel: 'Legacy CSS/JS engine',
+            toolTip:
+              'Uses the legacy CSS & JS animation engine. Stable with rich visuals, but performance is heavier with known unfixable limitations. Only receives Play Music updates. Supports all three scrolling modes.',
+            type: 'radio',
+            checked: currentEngine === 'old',
+            click: async () => {
+              if (currentEngine === 'old') return;
+              await setConfig({ engine: 'old' });
+              await refresh?.();
+              const result = await dialog.showMessageBox(window, {
+                type: 'info',
+                title: 'Engine Changed',
+                message:
+                  'Better Lyrics engine has been changed to Old engine. The app needs to restart to apply the change.',
+                buttons: ['Restart Now', 'Later'],
+                defaultId: 0,
+                cancelId: 1,
+              });
+
+              if (result.response === 0) {
+                restart();
+              }
+            },
+          },
+          {
+            label: 'New engine (Beta)',
+            sublabel: 'New WAAPI engine',
+            toolTip:
+              'Uses the new WAAPI animation engine. Delivers higher performance, better sync/seek handling, and supports all three scrolling modes. Note: This engine is currently in Beta and under active development.',
+            type: 'radio',
+            checked: currentEngine === 'new',
+            click: async () => {
+              if (currentEngine === 'new') return;
+              await setConfig({ engine: 'new' });
+              await refresh?.();
+              const result = await dialog.showMessageBox(window, {
+                type: 'info',
+                title: 'Engine Changed',
+                message:
+                  'Better Lyrics engine has been changed to New engine (Beta). The app needs to restart to apply the change.',
+                buttons: ['Restart Now', 'Later'],
+                defaultId: 0,
+                cancelId: 1,
+              });
+
+              if (result.response === 0) {
+                restart();
+              }
+            },
+          },
+        ],
+      },
+    ];
+
+    const currentScrolling = pluginConfig.scrollingMode || 'playmusicflow-turbo';
+
+    // Both engines can pick any of the three modes. 'smooth' means "let the
+    // engine do its own scrolling" — the new engine's built-in WAAPI scroll, or
+    // BetterLyrics' native CSS scroll on the legacy engine — and injects no
+    // scroll script at all.
+    menuItems.push({
+      label: 'Scrolling',
+      submenu: [
+        {
+          label: 'Smooth Scrolling',
+          sublabel: "Engine's built-in scrolling (Lightweight & responsive)",
+          toolTip:
+            'Leaves line transitions to the lyrics engine itself — no scroll script is injected. The lightest option, and the most responsive.',
+          type: 'radio',
+          checked: currentScrolling === 'smooth',
+          click: async () => {
+            if (currentScrolling === 'smooth') return;
+            await setConfig({ scrollingMode: 'smooth' });
+            await refresh?.();
+            const result = await dialog.showMessageBox(window, {
+              type: 'info',
+              title: 'Scrolling Mode Changed',
+              message:
+                'Scrolling mode has been changed to Smooth Scrolling. The app needs to restart to apply the change.',
+              buttons: ['Restart Now', 'Later'],
+              defaultId: 0,
+              cancelId: 1,
+            });
+
+            if (result.response === 0) {
+              restart();
+            }
+          },
+        },
+        {
+          label: 'PlayMusicFlow Scrolling',
+          sublabel:
+            'Signature fluid scrolling (Custom spring physics & motion)',
+          toolTip:
+            "Injects Play Music's custom PlayMusicFlow engine featuring dynamic spring physics and signature fluid motion curves.",
+          type: 'radio',
+          checked: currentScrolling === 'playmusicflow',
+          click: async () => {
+            if (currentScrolling === 'playmusicflow') return;
+            await setConfig({ scrollingMode: 'playmusicflow' });
+            await refresh?.();
+            const result = await dialog.showMessageBox(window, {
+              type: 'info',
+              title: 'Scrolling Mode Changed',
+              message:
+                'Scrolling mode has been changed to PlayMusicFlow Scrolling. The app needs to restart to apply the change.',
+              buttons: ['Restart Now', 'Later'],
+              defaultId: 0,
+              cancelId: 1,
+            });
+
+            if (result.response === 0) {
+              restart();
+            }
+          },
+        },
+        {
+          label: 'PlayMusicFlow Turbo',
+          sublabel: 'Same spring motion, GPU-composited (No main-thread cost)',
+          toolTip:
+            'The same PlayMusicFlow spring physics, solved ahead of time and handed to the compositor instead of being stepped every frame. Identical motion, but the main thread stays free — far smoother on heavy pages and high-refresh displays.',
+          type: 'radio',
+          checked: currentScrolling === 'playmusicflow-turbo',
+          click: async () => {
+            if (currentScrolling === 'playmusicflow-turbo') return;
+            await setConfig({ scrollingMode: 'playmusicflow-turbo' });
+            await refresh?.();
+            const result = await dialog.showMessageBox(window, {
+              type: 'info',
+              title: 'Scrolling Mode Changed',
+              message:
+                'Scrolling mode has been changed to PlayMusicFlow Turbo. The app needs to restart to apply the change.',
+              buttons: ['Restart Now', 'Later'],
+              defaultId: 0,
+              cancelId: 1,
+            });
+
+            if (result.response === 0) {
+              restart();
+            }
+          },
+        },
+      ],
+    });
+
+    return menuItems;
+  },
+  backend: {
+    async start({ getConfig, setConfig, window }) {
+      const pluginConfig = await getConfig();
+      const isNewEngine = pluginConfig.engine === 'new';
+      const extensionPath = extensionDir(isNewEngine);
+      const isPlayMusicTheme = isPlayMusicMergeTheme(pluginConfig.activeTheme);
+
+      console.log(
+        '[BetterLyrics] Engine:',
+        isNewEngine ? 'New engine (Beta) [bl-dev]' : 'Old engine [bl]',
+      );
+      console.log(
+        '[BetterLyrics] Active theme:',
+        pluginConfig.activeTheme || 'playmusic-merge-theme (default)',
+      );
+
+      // --- Manage album-color-theme-modded and better-lyrics-shaders based on active theme ---
+      if (isPlayMusicTheme) {
+        config.plugins.setOptions(
+          'album-color-theme-modded',
+          { enabled: true },
+          [],
+        );
+        config.plugins.setOptions(
+          'better-lyrics-shaders',
+          { enabled: true },
+          [],
+        );
+        console.log(
+          '[BetterLyrics] PlayMusic theme active → album-color-theme-modded and better-lyrics-shaders enabled',
+        );
+      } else {
+        config.plugins.setOptions(
+          'album-color-theme-modded',
+          { enabled: false },
+          [],
+        );
+        console.log(
+          '[BetterLyrics] Non-PlayMusic theme active → album-color-theme-modded disabled',
+        );
+      }
+
+      console.log('Loading Better Lyrics from:', extensionPath);
+
+      session.defaultSession
+        .loadExtension(extensionPath)
+        .then((ext) => {
+          console.log('Better Lyrics loaded! ID:', ext.id);
+        })
+        .catch((err) => {
+          console.error('Failed to load Better Lyrics:', err);
+        });
+
+      // (The merge theme and playmusicflow scripts have been moved to the preload script for instant execution without IPC delay)
+
+      // --- Fix 2: Block BL custom styles in PlayMusic mode ---
+      if (isPlayMusicTheme) {
+        const blockBLStylesScript = `
+          (function() {
+            // Remove any existing BL custom style tag
+            var existing = document.getElementById('blyrics-custom-style');
+            if (existing) {
+              existing.remove();
+              console.log('[BL-PlayMusicBlock] Removed existing blyrics-custom-style');
+            }
+
+            // Watch for new BL custom style tags and remove them
+            var observer = new MutationObserver(function(mutations) {
+              for (var i = 0; i < mutations.length; i++) {
+                var addedNodes = mutations[i].addedNodes;
+                for (var j = 0; j < addedNodes.length; j++) {
+                  var node = addedNodes[j];
+                  if (node.id === 'blyrics-custom-style') {
+                    node.remove();
+                    console.log('[BL-PlayMusicBlock] Blocked blyrics-custom-style injection');
+                  }
+                }
+              }
+            });
+
+            observer.observe(document.head, { childList: true });
+            console.log('[BL-PlayMusicBlock] MutationObserver active, blocking BL custom styles');
+          })();
+        `;
+
+        window.webContents.on('dom-ready', () => {
+          window.webContents
+            .executeJavaScript(blockBLStylesScript)
+            .catch((err: Error) => {
+              console.error(
+                '[BetterLyrics] Failed to inject PlayMusic style blocker:',
+                err,
+              );
+            });
+        });
+        console.log('[BetterLyrics] Queued PlayMusic style blocker');
+      }
+
+      // --- IPC handler for theme changes from BL settings UI ---
+      ipcMain.removeHandler('bl-set-active-theme');
+      ipcMain.handle(
+        'bl-set-active-theme',
+        async (_event, themeName: string) => {
+          const currentTheme =
+            (await getConfig()).activeTheme || 'playmusic-merge-theme';
+          if (currentTheme === themeName) return { changed: false };
+
+          await setConfig({ activeTheme: themeName });
+          console.log(
+            `[BetterLyrics] Theme changed: ${currentTheme} → ${themeName}`,
+          );
+
+          // Show restart dialog
+          const result = await dialog.showMessageBox(window, {
+            type: 'info',
+            title: 'Theme Changed',
+            message:
+              'Theme has been changed. The app needs to restart to apply the new theme.',
+            buttons: ['Restart Now', 'Later'],
+            defaultId: 0,
+            cancelId: 1,
+          });
+
+          if (result.response === 0) {
+            restart();
+          }
+
+          return { changed: true, theme: themeName };
+        },
+      );
+
+      // --- IPC handler to get current theme ---
+      ipcMain.removeHandler('bl-get-active-theme');
+      ipcMain.handle('bl-get-active-theme', async () => {
+        const cfg = await getConfig();
+        return cfg.activeTheme || 'playmusic-merge-theme';
+      });
+
+      // --- IPC handler for engine changes ---
+      ipcMain.removeHandler('bl-set-engine');
+      ipcMain.handle('bl-set-engine', async (_event, engine: 'old' | 'new') => {
+        const currentEngine = (await getConfig()).engine || 'old';
+        if (currentEngine === engine) return { changed: false };
+
+        await setConfig({ engine });
+        console.log(
+          `[BetterLyrics] Engine changed: ${currentEngine} → ${engine}`,
+        );
+
+        const result = await dialog.showMessageBox(window, {
+          type: 'info',
+          title: 'Engine Changed',
+          message: `Better Lyrics engine has been changed to ${engine === 'new' ? 'New engine (Beta)' : 'Old engine'}. The app needs to restart to apply the change.`,
+          buttons: ['Restart Now', 'Later'],
+          defaultId: 0,
+          cancelId: 1,
+        });
+
+        if (result.response === 0) {
+          restart();
+        }
+
+        return { changed: true, engine };
+      });
+
+      // --- IPC handler to get current engine ---
+      ipcMain.removeHandler('bl-get-engine');
+      ipcMain.handle('bl-get-engine', async () => {
+        const cfg = await getConfig();
+        return cfg.engine || 'old';
+      });
+    },
+  },
+  preload: {
+    async start({ getConfig }) {
+      const pluginConfig = await getConfig();
+      const isPlayMusicTheme = isPlayMusicMergeTheme(pluginConfig.activeTheme);
+
+      // The shaders content script reads these to pin itself to default settings.
+      // Published on two channels because they fail in different ways: the DOM is
+      // shared by every world on the page but is not yet built this early, while
+      // localStorage is available immediately. Either one is enough.
+      // Both branches run so a flag left behind by a previous session on the
+      // playmusic theme is cleared when the user switches away from it.
+      const publishThemeLock = () => {
+        try {
+          if (isPlayMusicTheme) {
+            localStorage.setItem(PLAYMUSIC_THEME_LOCK_KEY, '1');
+          } else {
+            localStorage.removeItem(PLAYMUSIC_THEME_LOCK_KEY);
+          }
+        } catch (err) {
+          console.error(
+            '[BetterLyrics Preload] Could not publish the theme lock flag:',
+            err,
+          );
+        }
+
+        const root = document.documentElement;
+        if (!root) return;
+        if (isPlayMusicTheme) {
+          root.setAttribute(PLAYMUSIC_THEME_LOCK_ATTRIBUTE, '1');
+        } else {
+          root.removeAttribute(PLAYMUSIC_THEME_LOCK_ATTRIBUTE);
+        }
+      };
+
+      publishThemeLock();
+      // YouTube Music replaces the document element during its own boot, which
+      // would drop the attribute set above.
+      window.addEventListener('DOMContentLoaded', publishThemeLock);
+
+      const isNewEngine = pluginConfig.engine === 'new';
+      const engineFolder = isNewEngine ? 'bl-dev' : 'bl';
+
+      let basePath = path.join(__dirname, '../../');
+      if (!fs.existsSync(path.join(basePath, 'extensions', engineFolder))) {
+        basePath = process.resourcesPath;
+      }
+
+      const blExtRoot = path.join(basePath, 'extensions', engineFolder);
+      const scriptsToInject: string[] = [];
+
+      // 1. Eagerly read theme files only if PlayMusic Merge Theme is active
+      if (isPlayMusicTheme) {
+        const mergeThemeFiles = ['mergetheme.js', 'fix.js'];
+        for (const fileName of mergeThemeFiles) {
+          try {
+            const jsPath = path.join(blExtRoot, fileName);
+            if (fs.existsSync(jsPath)) {
+              scriptsToInject.push(fs.readFileSync(jsPath, 'utf8'));
+            }
+          } catch (err) {
+            console.error(
+              `[BetterLyrics Preload] Failed to read ${fileName}:`,
+              err,
+            );
+          }
+        }
+      }
+
+      // 2. Which scroll script to inject, for EITHER engine and ANY theme. 'smooth'
+      // means the engine handles its own scrolling, so nothing is injected.
+      const scrollScripts: Record<string, string | null> = {
+        'playmusicflow': 'playmusicflow.js',
+        'playmusicflow-turbo': 'playmusicflow-turbo.js',
+        'smooth': null,
+      };
+      const scrollMode = pluginConfig.scrollingMode ?? 'playmusicflow-turbo';
+      // An unknown value (config written by a newer build, then downgraded)
+      // falls back to the original rAF engine rather than silently disabling
+      // scrolling altogether — for a corrupt/unrecognised value, the
+      // longest-serving path is the safer landing spot even though Turbo is
+      // now the default.
+      const scrollScript =
+        scrollMode in scrollScripts
+          ? scrollScripts[scrollMode]
+          : 'playmusicflow.js';
+
+      if (pluginConfig.enableV4Scroll !== false && scrollScript) {
+        try {
+          const jsPath = path.join(blExtRoot, scrollScript);
+          if (fs.existsSync(jsPath)) {
+            scriptsToInject.push(fs.readFileSync(jsPath, 'utf8'));
+          }
+        } catch (err) {
+          console.error(
+            `[BetterLyrics Preload] Failed to read ${scrollScript}:`,
+            err,
+          );
+        }
+      }
+
+      // 3. Inject natively via webFrame instantly upon DOMContentLoaded
+      if (scriptsToInject.length > 0) {
+        window.addEventListener('DOMContentLoaded', async () => {
+          for (const scriptCode of scriptsToInject) {
+            try {
+              await webFrame.executeJavaScript(scriptCode);
+            } catch (err) {
+              console.error(
+                '[BetterLyrics Preload] Failed to execute injected script via webFrame:',
+                err,
+              );
+            }
+          }
+          console.log(
+            '[BetterLyrics Preload] Successfully injected scripts securely via webFrame.',
+          );
+        });
+      }
+    },
+  },
+  renderer: {
+    observer: null as MutationObserver | null,
+    onPlayerApiReady() {
+      const setupButton = () => {
+        const topRow = document.querySelector(
+          '.top-row-buttons.ytmusic-player',
+        );
+        if (!topRow) return;
+
+        if (topRow.querySelector('.fullscreen-lyrics-button')) return;
+
+        const btn = document.createElement('yt-icon-button');
+        btn.className = 'fullscreen-lyrics-button style-scope ytmusic-player';
+        btn.setAttribute('title', 'Fullscreen lyrics without fullscreen');
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('tabindex', '0');
+        btn.setAttribute('aria-label', 'Fullscreen lyrics without fullscreen');
+
+        btn.innerHTML = `
+          <button id="button" class="style-scope yt-icon-button" aria-label="Fullscreen lyrics without fullscreen" style="color: inherit; background: transparent; border: none; padding: 0; cursor: pointer;">
+            <span class="yt-icon-shape style-scope yt-icon yt-spec-icon-shape" style="width: 24px; height: 24px; display: block; fill: currentColor; color: inherit;">
+              <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 0 24 24" width="24" focusable="false" aria-hidden="true" style="pointer-events: none; display: block; width: 100%; height: 100%; fill: currentColor;">
+                <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14zM7 8h6v2H7V8zm0 4h4v2H7v-2zm0 4h7v2H7v-2zm9-9v4.55c-.39-.24-.85-.38-1.34-.38-1.47 0-2.66 1.19-2.66 2.66s1.19 2.66 2.66 2.66 2.66-1.19 2.66-2.66V9h2V7h-3z"></path>
+              </svg>
+            </span>
+          </button>
+          <yt-interaction id="interaction" class="circular style-scope yt-icon-button">
+            <div class="stroke style-scope yt-interaction"></div>
+            <div class="fill style-scope yt-interaction"></div>
+          </yt-interaction>
+        `;
+
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const originalFullscreenElement = Object.getOwnPropertyDescriptor(
+            Document.prototype,
+            'fullscreenElement',
+          );
+          const originalRequestFullscreen = Element.prototype.requestFullscreen;
+
+          Object.defineProperty(document, 'fullscreenElement', {
+            get: () => document.documentElement,
+            configurable: true,
+          });
+
+          Element.prototype.requestFullscreen = function () {
+            document.dispatchEvent(new Event('fullscreenchange'));
+            return Promise.resolve();
+          };
+
+          const restore = () => {
+            if (originalFullscreenElement) {
+              Object.defineProperty(
+                document,
+                'fullscreenElement',
+                originalFullscreenElement,
+              );
+            } else {
+              delete (document as any).fullscreenElement;
+            }
+            Element.prototype.requestFullscreen = originalRequestFullscreen;
+          };
+
+          const clickFullscreen = () => {
+            const fsBtn = document.querySelector<HTMLElement>(
+              'yt-icon-button.fullscreen-button.ytmusic-player',
+            );
+            if (fsBtn) {
+              fsBtn.click();
+              window.dispatchEvent(new Event('resize'));
+              setTimeout(restore, 500);
+            } else {
+              restore();
+            }
+          };
+
+          const fsBtn = document.querySelector<HTMLElement>(
+            'yt-icon-button.fullscreen-button.ytmusic-player',
+          );
+          if (fsBtn) {
+            clickFullscreen();
+          } else {
+            const playerBar =
+              document.querySelector<HTMLElement>('ytmusic-player-bar');
+            if (playerBar) {
+              playerBar.click();
+              setTimeout(clickFullscreen, 500);
+            } else {
+              restore();
+            }
+          }
+        });
+
+        const fsBtn = topRow.querySelector('.fullscreen-button');
+        if (fsBtn) {
+          topRow.insertBefore(btn, fsBtn);
+        } else {
+          topRow.appendChild(btn);
+        }
+      };
+
+      setupButton();
+
+      this.observer = new MutationObserver(() => {
+        setupButton();
+      });
+
+      const target =
+        document.querySelector('.top-row-buttons.ytmusic-player') ||
+        document.body;
+      this.observer.observe(target, { childList: true, subtree: true });
+    },
+    stop() {
+      this.observer?.disconnect();
+      document.querySelector('.fullscreen-lyrics-button')?.remove();
+    },
+  },
+});

@@ -1,0 +1,80 @@
+import '@total-typescript/ts-reset';
+
+import type * as config from './config';
+import type { t } from '@/i18n';
+import type { VideoDataChanged } from '@/types/video-data-changed';
+import type { ipcRenderer as electronIpcRenderer } from 'electron';
+import type is from 'electron-is';
+import type { trustedTypes } from 'trusted-types';
+
+declare global {
+  interface Compressor {
+    audioSource: MediaElementAudioSourceNode;
+    audioContext: AudioContext;
+    /**
+     * The element `audioSource` was created from. A media element can only
+     * ever back one MediaElementAudioSourceNode, so consumers that want to
+     * re-route the graph need to know whether this source still corresponds
+     * to the video currently on the page.
+     */
+    video: HTMLVideoElement;
+  }
+
+  /**
+   * The shared audio bus renderer.ts publishes for the Better Lyrics and Tacet
+   * extensions, which live in the page world and cannot call
+   * createMediaElementSource themselves — only one source per media element is
+   * ever possible, so everything downstream has to share this one.
+   */
+  interface BlyricsAudioBus {
+    version: number;
+    context: AudioContext;
+    source: MediaElementAudioSourceNode;
+    element: HTMLVideoElement;
+  }
+
+  interface DocumentEventMap {
+    'peard:audio-can-play': CustomEvent<Compressor>;
+    'videodatachange': CustomEvent<VideoDataChanged>;
+    /**
+     * Dispatched by the crossfade plugin immediately before it advances the
+     * player to the next track (playerApi.nextVideo() or the next-button
+     * click) as part of an automatic end-of-track transition. Payload-free
+     * on purpose: consumers such as smooth-transitions only need the
+     * timing, to tell this advance apart from a user-initiated skip.
+     */
+    'crossfade:auto-advance': CustomEvent<void>;
+  }
+
+  interface Window {
+    trustedTypes?: typeof trustedTypes;
+    ipcRenderer: typeof electronIpcRenderer;
+    mainConfig: typeof config;
+    electronIs: typeof is;
+    ELECTRON_RENDERER_URL: string | undefined;
+    __blyricsAudio?: BlyricsAudioBus;
+    /**
+     * Internal variable (Last interaction time)
+     */
+    _lact: number;
+    navigation: Navigation;
+    download: () => void;
+    togglePictureInPicture: () => void;
+    reload: () => void;
+    i18n: {
+      t: typeof t;
+    };
+  }
+}
+
+// import { Howl as _Howl } from 'howler';
+declare module 'howler' {
+  interface Howl {
+    _sounds: {
+      _paused: boolean;
+      _ended: boolean;
+      _id: string;
+      _node: HTMLMediaElement;
+    }[];
+  }
+}

@@ -1,0 +1,12 @@
+[submodule "extensions-src/better-lyrics-playmusic"]
+	path = extensions-src/better-lyrics-playmusic
+	url = https://github.com/kevin-john-mathew/better-lyrics-playmusic
+[submodule "extensions-src/shaders-playmusic"]
+	path = extensions-src/shaders-playmusic
+	url = https://github.com/kevin-john-mathew/shaders-playmusic
+[submodule "extensions-src/better-lyrics-playmusic-dev"]
+	path = extensions-src/better-lyrics-playmusic-dev
+	url = https://github.com/kevin-john-mathew/better-lyrics-playmusic-dev
+[submodule "extensions-src/tacet-playmusic"]
+	path = extensions-src/tacet-playmusic
+	url = https://github.com/kevin-john-mathew/tacet-playmusic
